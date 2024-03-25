@@ -7,7 +7,6 @@ defmodule CubQ.Queue do
            {:min_key, key}
            | {:max_key, key}
            | {:reverse, boolean}
-           | {:pipe, [{:take, pos_integer}]}
 
   @spec enqueue(GenServer.server(), term, CubQ.item()) :: :ok | {:error, term}
 
@@ -97,22 +96,14 @@ defmodule CubQ.Queue do
 
   def delete_all(db, queue, batch_size \\ 100) do
     conditions = select_conditions(queue)
-    pipe = Keyword.get(conditions, :pipe, []) |> Keyword.put(:take, batch_size)
-    batch_conditions = Keyword.put(conditions, :pipe, pipe)
 
-    case CubDB.select(db, batch_conditions) do
-      {:ok, []} ->
-        :ok
-
-      {:ok, items} when is_list(items) ->
-        keys = Enum.map(items, fn {key, _value} -> key end)
-
-        with :ok <- CubDB.delete_multi(db, keys),
-             do: delete_all(db, queue, batch_size)
-
-      {:error, error} ->
-        {:error, error}
-    end
+    CubDB.select(db, conditions)
+    |> Stream.chunk_every(batch_size)
+    |> Stream.map(fn items when is_list(items) ->
+      keys = Enum.map(items, fn {key, _value} -> key end)
+      CubDB.delete_multi(db, keys)
+    end)
+    |> Stream.run()
   end
 
   @spec dequeue_ack(GenServer.server(), term, timeout) ::
@@ -153,20 +144,21 @@ defmodule CubQ.Queue do
 
   def nack(db, queue, ack_id) do
     # item can be requeued at the start or at the end of the queue
-    {conditions, increment} = case ack_id do
-      {_, _, _, :end} ->
-        {[{:reverse, true} | select_conditions(queue)], 1}
+    {conditions, increment} =
+      case ack_id do
+        {_, _, _, :end} ->
+          {[{:reverse, true} | select_conditions(queue)], 1}
 
-      _ ->
-        {select_conditions(queue), -1}
-    end
+        _ ->
+          {select_conditions(queue), -1}
+      end
 
     case get_entry(db, queue, conditions) do
       {:ok, {{_queue, n}, _value}} ->
-        with {:ok, nil} <- commit_nack(db, queue, ack_id, n + increment), do: :ok
+        with nil <- commit_nack(db, queue, ack_id, n + increment), do: :ok
 
       nil ->
-        with {:ok, nil} <- commit_nack(db, queue, ack_id, 0), do: :ok
+        with nil <- commit_nack(db, queue, ack_id, 0), do: :ok
 
       other ->
         other
@@ -178,34 +170,31 @@ defmodule CubQ.Queue do
         ]
 
   def get_pending_acks!(db, queue) do
-    case CubDB.select(db,
+    CubDB.select(db,
       min_key: {queue, nil, 0, 0},
       max_key: {queue, [], nil, []}
-    ) do
-      {:ok, entries} -> entries
-      {:error, error} -> raise(error)
-    end
+    )
+    |> Enum.to_list()
   end
 
   @spec select_conditions(term) :: [select_option]
 
   defp select_conditions(queue) do
-    [min_key: {queue, -1.0e32}, max_key: {queue, nil}, pipe: [take: 1]]
+    [min_key: {queue, -1.0e32}, max_key: {queue, nil}]
   end
 
   @spec get_entry(GenServer.server(), term, [select_option]) ::
           {:ok, entry} | nil | {:error, term}
 
   defp get_entry(db, queue, conditions) do
-    case CubDB.select(db, conditions) do
-      {:ok, [entry = {{^queue, n}, _value}]} when is_number(n) ->
+    entry = CubDB.select(db, conditions) |> Stream.take(1) |> Enum.to_list()
+
+    case entry do
+      [entry = {{^queue, n}, _value}] when is_number(n) ->
         {:ok, entry}
 
-      {:ok, []} ->
+      [] ->
         nil
-
-      {:error, error} ->
-        {:error, error}
     end
   end
 
@@ -219,7 +208,7 @@ defmodule CubQ.Queue do
     case CubDB.get_and_update_multi(db, [], fn _ ->
            {nil, %{ack_id => {item, timeout}}, [key]}
          end) do
-      {:ok, nil} ->
+      nil ->
         {:ok, item, ack_id}
 
       other ->
@@ -228,7 +217,7 @@ defmodule CubQ.Queue do
   end
 
   @spec commit_nack(GenServer.server(), term, CubQ.ack_id(), number) ::
-          {:ok, term} | {:error, term}
+          any
 
   defp commit_nack(db, queue, ack_id, n) do
     CubDB.get_and_update_multi(db, [ack_id], fn

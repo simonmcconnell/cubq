@@ -2,8 +2,10 @@ defmodule CubQTest do
   use ExUnit.Case, async: true
   doctest CubQ
 
-  setup do
-    tmp_dir = :os.cmd('mktemp -d') |> List.to_string() |> String.trim() |> String.to_charlist()
+  @moduletag :tmp_dir
+
+  setup %{tmp_dir: tmp_dir} do
+    tmp_dir = tmp_dir |> String.to_charlist()
     cubdb_options = [data_dir: tmp_dir, auto_file_sync: false, auto_compact: false]
 
     {:ok, db} = CubDB.start_link(cubdb_options)
