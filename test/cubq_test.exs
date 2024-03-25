@@ -10,14 +10,6 @@ defmodule CubQTest do
 
     {:ok, db} = CubDB.start_link(cubdb_options)
 
-    on_exit(fn ->
-      with {:ok, files} <- File.ls(tmp_dir) do
-        for file <- files, do: File.rm(Path.join(tmp_dir, file))
-      end
-
-      :ok = File.rmdir(tmp_dir)
-    end)
-
     {:ok, db: db}
   end
 
